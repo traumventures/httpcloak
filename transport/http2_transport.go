@@ -976,6 +976,36 @@ func (t *HTTP2Transport) newUTLSConn(rawConn net.Conn, cfg *utls.Config, spec *u
 	return tlsConn, nil
 }
 
+// HandshakeOnConn performs the TLS handshake on a connection the caller dialled
+// itself, presenting exactly the ClientHello this transport's own connections
+// present: same spec resolution (custom JA3, raw hello, preset JA3, PSK variant,
+// shuffle seed), same uTLS config flags, same verification hooks, same session
+// cache. echConfigList may be nil for no ECH; unlike the pooled path there is no
+// ECH lookup or no-ECH retry here, the caller decides.
+//
+// It is the TLS half of the owned-connection API. A forwarding proxy has to dial
+// the upstream itself, because the hop through its upstream proxy (and the
+// sticky session that hop selects) is the thing it must control, but it must
+// not re-implement fingerprint selection or its ClientHello drifts from this
+// library's.
+//
+// The caller owns the returned connection; it is not pooled. On error rawConn is
+// left open for the caller to close.
+func (t *HTTP2Transport) HandshakeOnConn(ctx context.Context, rawConn net.Conn, serverName string, echConfigList []byte) (*utls.UConn, error) {
+	spec, err := t.clientHelloSpec()
+	if err != nil {
+		return nil, err
+	}
+	tlsConn, err := t.newUTLSConn(rawConn, t.utlsConfig(serverName, echConfigList), spec)
+	if err != nil {
+		return nil, err
+	}
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, fmt.Errorf("TLS handshake failed: %w", err)
+	}
+	return tlsConn, nil
+}
+
 // dialThroughProxy establishes a connection through a proxy using CONNECT
 // Supports both HTTP proxies (HTTP CONNECT) and SOCKS5 proxies (SOCKS5 CONNECT)
 func (t *HTTP2Transport) dialThroughProxy(ctx context.Context, targetHost, targetPort string) (net.Conn, error) {

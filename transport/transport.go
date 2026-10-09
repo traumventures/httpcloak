@@ -186,6 +186,19 @@ type Request struct {
 	Body       []byte
 	BodyReader io.Reader // For streaming uploads - used instead of Body if set
 
+	// ContentLength states the length of BodyReader in bytes, or -1 for a
+	// body of unknown length, which is then sent chunked on HTTP/1.1. Zero
+	// means "not stated": the length is inferred from BodyReader's type
+	// (*bytes.Reader, *bytes.Buffer, *strings.Reader) and anything else goes
+	// out chunked. Ignored when BodyReader is nil.
+	//
+	// Inference forces a caller who wants a real Content-Length to buffer
+	// the whole body first, which is exactly what a forwarding proxy must not
+	// do: it should relay the client's own framing while streaming the body
+	// through. The value is trusted; a body that does not match it is a
+	// malformed request.
+	ContentLength int64
+
 	// GetBody returns a fresh reader over the same body for a request that has
 	// to go on the wire more than once: a 307/308 redirect hop, or a retried
 	// attempt. Nil means the body cannot be re-opened.
@@ -1965,6 +1978,7 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 	if err != nil {
 		return nil, NewRequestError("create_request", host, port, "h1", err)
 	}
+	applyContentLength(httpReq, req)
 
 	// Determine effective TLS-only mode: per-request override takes precedence
 	effectiveTLSOnly := t.tlsOnly
@@ -2072,6 +2086,7 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 		alpnErr.TLSConn.Close()
 		return nil, NewRequestError("create_request", host, port, "h1", err)
 	}
+	applyContentLength(httpReq, req)
 
 	// Determine effective TLS-only mode: per-request override takes precedence
 	effectiveTLSOnly := t.tlsOnly
@@ -2185,6 +2200,7 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	if err != nil {
 		return nil, NewRequestError("create_request", host, port, "h2", err)
 	}
+	applyContentLength(httpReq, req)
 
 	// Determine effective TLS-only mode: per-request override takes precedence
 	effectiveTLSOnly := t.tlsOnly
@@ -2317,6 +2333,7 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	if err != nil {
 		return nil, NewRequestError("create_request", host, port, "h3", err)
 	}
+	applyContentLength(httpReq, req)
 
 	// Determine effective TLS-only mode: per-request override takes precedence
 	effectiveTLSOnly := t.tlsOnly
@@ -2795,6 +2812,21 @@ func applyExactHeaders(httpReq *http.Request, exact []fingerprint.HeaderPair, pr
 		httpReq.Header[http.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
 	}
 	return true
+}
+
+// applyContentLength applies an explicitly stated Request.ContentLength to the
+// outgoing request, overriding what http.NewRequest inferred from the body
+// reader's type. -1 leaves the length unknown, which the HTTP/1.1 writer frames
+// as chunked and HTTP/2 and HTTP/3 send without a content-length.
+func applyContentLength(httpReq *http.Request, req *Request) {
+	if req.BodyReader == nil || req.ContentLength == 0 {
+		return
+	}
+	if req.ContentLength < 0 {
+		httpReq.ContentLength = -1
+		return
+	}
+	httpReq.ContentLength = req.ContentLength
 }
 
 // mergeCallerHeaders folds Request.Headers over whatever the preset pipeline

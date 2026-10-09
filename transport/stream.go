@@ -407,6 +407,7 @@ func (t *Transport) doStreamHTTP1(ctx context.Context, req *Request) (*StreamRes
 		cancel()
 		return nil, NewRequestError("create_request", host, port, "h1", err)
 	}
+	applyContentLength(httpReq, req)
 
 	// Determine effective TLS-only mode: per-request override takes precedence
 	effectiveTLSOnly := t.tlsOnly
@@ -507,6 +508,7 @@ func (t *Transport) doStreamHTTP2(ctx context.Context, req *Request) (*StreamRes
 		cancel()
 		return nil, NewRequestError("create_request", host, port, "h2", err)
 	}
+	applyContentLength(httpReq, req)
 
 	// Determine effective TLS-only mode: per-request override takes precedence
 	effectiveTLSOnly := t.tlsOnly
@@ -605,6 +607,7 @@ func (t *Transport) doStreamHTTP3(ctx context.Context, req *Request) (*StreamRes
 		cancel()
 		return nil, NewRequestError("create_request", host, port, "h3", err)
 	}
+	applyContentLength(httpReq, req)
 
 	// Determine effective TLS-only mode: per-request override takes precedence
 	effectiveTLSOnly := t.tlsOnly

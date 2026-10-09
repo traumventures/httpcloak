@@ -315,6 +315,7 @@ func (t *Transport) newOwnedRequest(ctx context.Context, snap transportSnapshot,
 	if err != nil {
 		return nil, err
 	}
+	applyContentLength(httpReq, req)
 
 	effectiveTLSOnly := t.tlsOnly
 	if req.TLSOnly != nil {

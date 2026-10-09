@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -69,8 +70,14 @@ func (t *Transport) doStreamOnConn(ctx context.Context, req *Request, proto stri
 	// Cancellation belongs to the body, not to this call: the body is still
 	// being read after we return. The timeout covers the header wait only, the
 	// same way DoStream bounds establishment and then lets the stream run.
-	ctx, cancel := context.WithCancel(ctx)
-	finishHeaderWait := boundStreamEstablishment(t.streamEffectiveTimeout(req), cancel)
+	//
+	// The watchdog cancels with ErrResponseHeaderTimeout as the cause, so a
+	// timeout is reported as one rather than as the context.Canceled every
+	// layer below sees: a caller that treats "canceled" as "the client went
+	// away" would otherwise misfile a slow origin.
+	ctx, cancelCause := context.WithCancelCause(ctx)
+	cancel := func() { cancelCause(nil) }
+	finishHeaderWait := boundHeaderWait(t.streamEffectiveTimeout(req), cancelCause)
 
 	httpReq, err := t.newOwnedRequest(ctx, snap, req, proto)
 	if err != nil {
@@ -83,6 +90,9 @@ func (t *Transport) doStreamOnConn(ctx context.Context, req *Request, proto stri
 	resp, err := roundTrip(httpReq)
 	finishHeaderWait()
 	if err != nil {
+		if errors.Is(context.Cause(ctx), ErrResponseHeaderTimeout) {
+			err = fmt.Errorf("%w after %v", ErrResponseHeaderTimeout, t.streamEffectiveTimeout(req))
+		}
 		cancel()
 		return nil, WrapError("roundtrip", host, port, proto, err)
 	}
@@ -106,6 +116,24 @@ func (t *Transport) doStreamOnConn(ctx context.Context, req *Request, proto stri
 		Timing:        timing,
 		Protocol:      proto,
 	}, nil
+}
+
+// ErrResponseHeaderTimeout reports that the response headers did not arrive
+// within the request's timeout on a streamed owned-connection exchange. The
+// request was sent; whether the origin processed it is unknown.
+var ErrResponseHeaderTimeout error = headerTimeoutError{}
+
+type headerTimeoutError struct{}
+
+func (headerTimeoutError) Error() string   { return "timeout awaiting response headers" }
+func (headerTimeoutError) Timeout() bool   { return true }
+func (headerTimeoutError) Temporary() bool { return true }
+
+// boundHeaderWait is boundStreamEstablishment with a cancellation cause: if
+// the response headers have not arrived within timeout, it cancels with
+// ErrResponseHeaderTimeout. The returned func stops the watchdog.
+func boundHeaderWait(timeout time.Duration, cancel context.CancelCauseFunc) (finish func()) {
+	return boundStreamEstablishment(timeout, func() { cancel(ErrResponseHeaderTimeout) })
 }
 
 // decodesStream reports whether setupStreamDecompressor decodes this

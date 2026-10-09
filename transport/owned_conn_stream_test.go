@@ -150,11 +150,40 @@ func TestOwnedH1StreamHeaderTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("no error for a response that never came")
 	}
+	// A timeout, not a cancellation: the caller must be able to tell a slow
+	// origin from its own context ending.
+	if !errors.Is(err, ErrResponseHeaderTimeout) || errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want ErrResponseHeaderTimeout and not context.Canceled", err)
+	}
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("timeout took %v", d)
 	}
 	if _, err := tlsConn.Write([]byte("x")); err == nil {
 		t.Fatal("connection still open after an interrupted exchange")
+	}
+}
+
+// The same on HTTP/2.
+func TestOwnedH2StreamHeaderTimeout(t *testing.T) {
+	hold := make(chan struct{})
+	defer close(hold)
+	srv := startH2Server(t, h2Config{OnRequest: func(uint32, int) { <-hold }})
+	tr := newTestTransport(t, "chrome-latest")
+	h2c, err := tr.NewH2ClientConn(context.Background(), dialOwned(t, tr, srv.addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2c.Close()
+	_, err = tr.DoStreamOnH2Conn(context.Background(), &Request{URL: localURL(srv.addr, "/"), Timeout: 300 * time.Millisecond}, h2c)
+	if !errors.Is(err, ErrResponseHeaderTimeout) || errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want ErrResponseHeaderTimeout and not context.Canceled", err)
+	}
+	// The caller's own cancellation is still a cancellation.
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	_, err = tr.DoStreamOnH2Conn(ctx, &Request{URL: localURL(srv.addr, "/"), Timeout: 5 * time.Second}, h2c)
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrResponseHeaderTimeout) {
+		t.Fatalf("caller cancel: err = %v, want context.Canceled", err)
 	}
 }
 

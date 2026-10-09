@@ -214,6 +214,111 @@ func (t *HTTP2Transport) buildH2Transport() *http2.Transport {
 	}
 }
 
+// clientHelloSpec returns a fresh ClientHelloSpec for one connection.
+// Precedence: custom JA3 > preset JA3 > PSK variant > regular preset, the
+// preset variants shuffled with the transport's seed so every connection of
+// one transport presents the same extension order. A fresh spec is needed per
+// connection because utls's ApplyPreset mutates it. A nil spec (with nil
+// error) means "fall back to preset.ClientHelloID".
+func (t *HTTP2Transport) clientHelloSpec() (*utls.ClientHelloSpec, error) {
+	ja3String := ""
+	var ja3Extras *fingerprint.JA3Extras
+	if t.config != nil && t.config.CustomJA3 != "" {
+		ja3String = t.config.CustomJA3
+		ja3Extras = t.config.CustomJA3Extras
+	} else if t.preset.JA3 != "" {
+		ja3String = t.preset.JA3
+		ja3Extras = t.preset.JA3Extras
+	}
+	if ja3String != "" {
+		spec, err := fingerprint.ParseJA3(ja3String, ja3Extras)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse JA3: %w", err)
+		}
+		return spec, nil
+	}
+	if t.hasPSKSpec {
+		if spec, err := utls.UTLSIdToSpecWithSeed(t.preset.PSKClientHelloID, t.shuffleSeed); err == nil {
+			return &spec, nil
+		}
+	}
+	if spec, err := utls.UTLSIdToSpecWithSeed(t.preset.ClientHelloID, t.shuffleSeed); err == nil {
+		return &spec, nil
+	}
+	return nil, nil
+}
+
+// utlsConfig builds the uTLS client config for one connection to serverName.
+// ECH requires TLS 1.3, so MinVersion is raised when an ECH config is given.
+func (t *HTTP2Transport) utlsConfig(serverName string, echConfigList []byte) *utls.Config {
+	minVersion := uint16(tls.VersionTLS12)
+	if len(echConfigList) > 0 {
+		minVersion = tls.VersionTLS13
+	}
+	var keyLogWriter io.Writer
+	if t.config != nil && t.config.KeyLogWriter != nil {
+		keyLogWriter = t.config.KeyLogWriter
+	} else {
+		keyLogWriter = GetKeyLogWriter()
+	}
+	cfg := &utls.Config{
+		ServerName:                         serverName,
+		InsecureSkipVerify:                 t.insecureSkipVerify,
+		MinVersion:                         minVersion,
+		MaxVersion:                         tls.VersionTLS13,
+		OmitEmptyPsk:                       true, // Chrome doesn't send empty PSK on first connection
+		PreferSkipResumptionOnNilExtension: true, // Skip resumption if spec has no PSK extension instead of panicking
+		EncryptedClientHelloConfigList:     echConfigList,
+		KeyLogWriter:                       keyLogWriter,
+	}
+	// Only enable session cache if we have PSK spec - prevents panic when session
+	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
+	if t.hasPSKSpec {
+		cfg.ClientSessionCache = t.sessionCache
+	}
+	return cfg
+}
+
+// newUTLSConn wraps rawConn in a uTLS client presenting spec (or the preset's
+// ClientHelloID when spec is nil). It does not handshake.
+func (t *HTTP2Transport) newUTLSConn(rawConn net.Conn, cfg *utls.Config, spec *utls.ClientHelloSpec) (*utls.UConn, error) {
+	var tlsConn *utls.UConn
+	if spec != nil {
+		tlsConn = utls.UClient(rawConn, cfg, utls.HelloCustom)
+		if err := tlsConn.ApplyPreset(spec); err != nil {
+			return nil, fmt.Errorf("failed to apply TLS preset: %w", err)
+		}
+	} else {
+		tlsConn = utls.UClient(rawConn, cfg, t.preset.ClientHelloID)
+	}
+	if t.hasPSKSpec {
+		tlsConn.SetSessionCache(t.sessionCache)
+	}
+	return tlsConn, nil
+}
+
+// HandshakeOnConn performs the TLS handshake on a caller-dialed connection
+// with exactly the ClientHello the pooled H2 path would send (custom JA3,
+// preset JA3, PSK variant, shuffle seed, TLS config flags). It is the TLS
+// half of the owned-connection API: forwarding proxies dial the upstream
+// themselves (to control the proxy hop and its sticky session) but must not
+// re-implement fingerprint selection, or their ClientHello drifts from
+// httpcloak's. echConfigList may be nil. The caller owns the returned conn.
+func (t *HTTP2Transport) HandshakeOnConn(ctx context.Context, rawConn net.Conn, serverName string, echConfigList []byte) (*utls.UConn, error) {
+	spec, err := t.clientHelloSpec()
+	if err != nil {
+		return nil, err
+	}
+	tlsConn, err := t.newUTLSConn(rawConn, t.utlsConfig(serverName, echConfigList), spec)
+	if err != nil {
+		return nil, err
+	}
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, fmt.Errorf("TLS handshake failed: %w", err)
+	}
+	return tlsConn, nil
+}
+
 // H2ClientConn is an HTTP/2 client over a caller-owned TLS connection.
 // Lifecycle is entirely the caller's: no pool, no silent reconnection on
 // failure. Call Close when done.
@@ -597,39 +702,11 @@ func (t *HTTP2Transport) createConn(ctx context.Context, host, port string) (*pe
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// Generate fresh spec for this connection to avoid race condition
-	// utls's ApplyPreset mutates the spec (clears KeyShares.Data, etc.), so each
-	// connection needs its own copy. Use same shuffleSeed for consistent ordering.
-	var specToUse *utls.ClientHelloSpec
-	// Determine JA3 source: config.CustomJA3 takes priority, then preset.JA3
-	ja3String := ""
-	var ja3Extras *fingerprint.JA3Extras
-	if t.config != nil && t.config.CustomJA3 != "" {
-		ja3String = t.config.CustomJA3
-		ja3Extras = t.config.CustomJA3Extras
-	} else if t.preset.JA3 != "" {
-		ja3String = t.preset.JA3
-		ja3Extras = t.preset.JA3Extras
-	}
-	if ja3String != "" {
-		// JA3: parse to fresh spec each connection (ApplyPreset mutates)
-		spec, parseErr := fingerprint.ParseJA3(ja3String, ja3Extras)
-		if parseErr != nil {
-			rawConn.Close()
-			return nil, fmt.Errorf("failed to parse JA3: %w", parseErr)
-		}
-		specToUse = spec
-	} else if t.hasPSKSpec {
-		// Generate fresh PSK spec for this connection
-		if spec, err := utls.UTLSIdToSpecWithSeed(t.preset.PSKClientHelloID, t.shuffleSeed); err == nil {
-			specToUse = &spec
-		}
-	}
-	if specToUse == nil {
-		// Generate fresh regular spec
-		if spec, err := utls.UTLSIdToSpecWithSeed(t.preset.ClientHelloID, t.shuffleSeed); err == nil {
-			specToUse = &spec
-		}
+	// Generate fresh spec for this connection (see clientHelloSpec).
+	specToUse, err := t.clientHelloSpec()
+	if err != nil {
+		rawConn.Close()
+		return nil, err
 	}
 
 	// Fetch ECH config if needed
@@ -644,57 +721,11 @@ func (t *HTTP2Transport) createConn(ctx context.Context, host, port string) (*pe
 		}
 	}
 
-	// Determine MinVersion based on ECH usage
-	// ECH requires TLS 1.3, so set MinVersion accordingly
-	minVersion := uint16(tls.VersionTLS12)
-	if len(echConfigList) > 0 {
-		minVersion = tls.VersionTLS13
-	}
-
-	// Determine key log writer - config override or global
-	var keyLogWriter io.Writer
-	if t.config != nil && t.config.KeyLogWriter != nil {
-		keyLogWriter = t.config.KeyLogWriter
-	} else {
-		keyLogWriter = GetKeyLogWriter()
-	}
-
-	// Wrap with uTLS for fingerprinting
-	tlsConfig := &utls.Config{
-		ServerName:                         host,
-		InsecureSkipVerify:                 t.insecureSkipVerify,
-		MinVersion:                         minVersion,
-		MaxVersion:                         tls.VersionTLS13,
-		OmitEmptyPsk:                       true,          // Chrome doesn't send empty PSK on first connection
-		PreferSkipResumptionOnNilExtension: true,          // Skip resumption if spec has no PSK extension instead of panicking
-		EncryptedClientHelloConfigList:     echConfigList, // ECH configuration (if available)
-		KeyLogWriter:                       keyLogWriter,
-	}
-
-	// Only enable session cache if we have PSK spec - prevents panic when session
-	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
-	if t.hasPSKSpec {
-		tlsConfig.ClientSessionCache = t.sessionCache
-	}
-
-	// Create UClient with HelloCustom and apply our fresh spec
-	// This ensures the TLS extension order is consistent across all connections (same seed)
-	var tlsConn *utls.UConn
-	if specToUse != nil {
-		// Use fresh spec - extension order is consistent from shuffle seed
-		tlsConn = utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
-		if err := tlsConn.ApplyPreset(specToUse); err != nil {
-			rawConn.Close()
-			return nil, fmt.Errorf("failed to apply TLS preset: %w", err)
-		}
-	} else {
-		// Fallback to ClientHelloID if spec generation failed
-		tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
-	}
-
-	// Set session cache for TLS resumption (only if PSK spec available)
-	if t.hasPSKSpec {
-		tlsConn.SetSessionCache(t.sessionCache)
+	tlsConfig := t.utlsConfig(host, echConfigList)
+	tlsConn, err := t.newUTLSConn(rawConn, tlsConfig, specToUse)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
 	}
 
 	// Perform TLS handshake
@@ -715,47 +746,15 @@ func (t *HTTP2Transport) createConn(ctx context.Context, host, port string) (*pe
 			}
 
 			// Regenerate fresh TLS spec (the previous one was consumed)
-			var fallbackSpec *utls.ClientHelloSpec
-			// Reuse same JA3 resolution logic as primary path
-			fallbackJA3 := ""
-			var fallbackJA3Extras *fingerprint.JA3Extras
-			if t.config != nil && t.config.CustomJA3 != "" {
-				fallbackJA3 = t.config.CustomJA3
-				fallbackJA3Extras = t.config.CustomJA3Extras
-			} else if t.preset.JA3 != "" {
-				fallbackJA3 = t.preset.JA3
-				fallbackJA3Extras = t.preset.JA3Extras
+			fallbackSpec, specErr := t.clientHelloSpec()
+			if specErr != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("speculative TLS fallback: %w", specErr)
 			}
-			if fallbackJA3 != "" {
-				spec, parseErr := fingerprint.ParseJA3(fallbackJA3, fallbackJA3Extras)
-				if parseErr != nil {
-					rawConn.Close()
-					return nil, fmt.Errorf("speculative TLS fallback: failed to parse JA3: %w", parseErr)
-				}
-				fallbackSpec = spec
-			} else if t.hasPSKSpec {
-				if spec, specErr := utls.UTLSIdToSpecWithSeed(t.preset.PSKClientHelloID, t.shuffleSeed); specErr == nil {
-					fallbackSpec = &spec
-				}
-			}
-			if fallbackSpec == nil {
-				if spec, specErr := utls.UTLSIdToSpecWithSeed(t.preset.ClientHelloID, t.shuffleSeed); specErr == nil {
-					fallbackSpec = &spec
-				}
-			}
-
-			// Redo TLS handshake on the clean connection
-			if fallbackSpec != nil {
-				tlsConn = utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
-				if applyErr := tlsConn.ApplyPreset(fallbackSpec); applyErr != nil {
-					rawConn.Close()
-					return nil, fmt.Errorf("speculative TLS fallback preset failed: %w", applyErr)
-				}
-			} else {
-				tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
-			}
-			if t.hasPSKSpec {
-				tlsConn.SetSessionCache(t.sessionCache)
+			tlsConn, err = t.newUTLSConn(rawConn, tlsConfig, fallbackSpec)
+			if err != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("speculative TLS fallback: %w", err)
 			}
 
 			if hsErr := tlsConn.HandshakeContext(ctx); hsErr != nil {

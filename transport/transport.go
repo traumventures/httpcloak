@@ -9,6 +9,7 @@ import (
 	"fmt"
 	http "github.com/sardanioss/http"
 	"io"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -2193,6 +2194,17 @@ func decompress(data []byte, encoding string) ([]byte, error) {
 // cannot drift, and so a failed request cannot be silently retried on a new
 // sticky-session lookup.
 // ----------------------------------------------------------------------------
+
+// HandshakeOwnedTLS performs the TLS handshake on a caller-dialed connection
+// with the same ClientHello this transport presents on its own connections,
+// including WithCustomFingerprint JA3 overrides. See
+// HTTP2Transport.HandshakeOnConn. Pair with NewH2ClientConn / DoStreamOnTLSConn.
+func (t *Transport) HandshakeOwnedTLS(ctx context.Context, rawConn net.Conn, serverName string, echConfigList []byte) (*utls.UConn, error) {
+	if t.h2Transport == nil {
+		return nil, fmt.Errorf("transport: HTTP/2 subsystem not initialised")
+	}
+	return t.h2Transport.HandshakeOnConn(ctx, rawConn, serverName, echConfigList)
+}
 
 // NewH2ClientConn is a convenience wrapper around
 // HTTP2Transport.NewClientConnOnConn. Use with DoOnH2Conn to issue requests

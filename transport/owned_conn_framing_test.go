@@ -2,10 +2,12 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	stdhttp "net/http"
 	"testing"
+	"time"
 )
 
 // framingH1Handler serves raw HTTP/1.1 responses whose framing the client has
@@ -110,4 +112,73 @@ func TestH1SkipsInterimResponses(t *testing.T) {
 			t.Fatal("six interim responses accepted; the cap is five")
 		}
 	})
+}
+
+// A body that does not match its declared Content-Length must fail the
+// request rather than go out misframed.
+func TestRequestContentLengthEnforcedH1(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		length int64
+	}{
+		{"short", "abc", 10},
+		{"long", "abcdefgh", 3},
+	}
+	for _, tc := range cases {
+		for _, path := range []string{"owned", "pooled"} {
+			t.Run(tc.name+"/"+path, func(t *testing.T) {
+				srv := startH1WireServer(t, framingH1Handler)
+				tr := newTestTransport(t, "chrome-latest")
+				req := &Request{Method: "POST", URL: localURL(srv.addr, "/echo"), BodyReader: opaque(tc.body), ContentLength: tc.length, Timeout: 3 * time.Second}
+				var err error
+				if path == "owned" {
+					tlsConn := dialOwned(t, tr, srv.addr)
+					_, err = tr.DoOnTLSConn(context.Background(), req, tlsConn)
+				} else {
+					tr.SetProtocol(ProtocolHTTP1)
+					_, err = tr.Do(context.Background(), req)
+				}
+				if !errors.Is(err, ErrContentLengthMismatch) {
+					t.Fatalf("err = %v, want ErrContentLengthMismatch", err)
+				}
+			})
+		}
+	}
+	t.Run("exact", func(t *testing.T) {
+		srv := startH1WireServer(t, framingH1Handler)
+		tr := newTestTransport(t, "chrome-latest")
+		tlsConn := dialOwned(t, tr, srv.addr)
+		resp, err := tr.DoOnTLSConn(context.Background(), &Request{Method: "POST", URL: localURL(srv.addr, "/echo"), BodyReader: opaque("abcde"), ContentLength: 5}, tlsConn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := resp.Text(); err != nil {
+			t.Fatal(err)
+		}
+		ex := srv.recorded()
+		if got := string(ex[len(ex)-1].body); got != "abcde" {
+			t.Fatalf("origin read body %q", got)
+		}
+	})
+}
+
+// HTTP/2 frames the body itself; a mismatch must still fail the stream.
+func TestRequestContentLengthEnforcedH2(t *testing.T) {
+	srv := startH2Server(t, h2Config{ReadToEndStream: true})
+	tr := newTestTransport(t, "chrome-latest")
+	h2c, err := tr.NewH2ClientConn(context.Background(), dialOwned(t, tr, srv.addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2c.Close()
+	for _, tc := range []struct {
+		body   string
+		length int64
+	}{{"abc", 10}, {"abcdefgh", 3}} {
+		_, err := tr.DoOnH2Conn(context.Background(), &Request{Method: "POST", URL: localURL(srv.addr, "/"), BodyReader: opaque(tc.body), ContentLength: tc.length, Timeout: 3 * time.Second}, h2c)
+		if err == nil {
+			t.Fatalf("body of %d bytes with content-length %d was accepted", len(tc.body), tc.length)
+		}
+	}
 }

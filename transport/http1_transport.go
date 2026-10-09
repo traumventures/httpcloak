@@ -12,6 +12,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1215,17 +1216,55 @@ func (t *HTTP1Transport) writeRequest(conn *http1Conn, req *http.Request) error 
 			if err := t.writeChunkedBody(conn.bw, req.Body); err != nil {
 				return err
 			}
-		} else {
-			_, err := io.Copy(conn.bw, req.Body)
-			if err != nil {
-				return err
-			}
+		} else if err := writeFramedBody(conn.bw, req); err != nil {
+			return err
 		}
 		if err := conn.bw.Flush(); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+// writeFramedBody writes a body framed by Content-Length, enforcing that the
+// body is exactly that long, as net/http does. Copying the body unchecked
+// trusted the declared length: a shorter body left the peer reading the next
+// request's bytes as the rest of this one, and a longer one put the excess on
+// the wire as the start of another message — request smuggling, with the
+// caller's stream as the payload. A body without a known length is copied as
+// before.
+func writeFramedBody(w io.Writer, req *http.Request) error {
+	declared := req.ContentLength
+	if declared <= 0 {
+		if v := req.Header.Get("Content-Length"); v != "" {
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err != nil || n < 0 {
+				return fmt.Errorf("http1: invalid Content-Length %q", v)
+			}
+			declared = n
+		}
+	}
+	if declared <= 0 {
+		_, err := io.Copy(w, req.Body)
+		return err
+	}
+	n, err := io.Copy(w, io.LimitReader(req.Body, declared))
+	if err != nil {
+		return err
+	}
+	if n < declared {
+		return fmt.Errorf("%w: body ended after %d of %d bytes", ErrContentLengthMismatch, n, declared)
+	}
+	// Anything left over is a body longer than declared. It is not written;
+	// reading it out is how the mismatch is detected.
+	extra, err := io.Copy(io.Discard, req.Body)
+	if err != nil {
+		return err
+	}
+	if extra > 0 {
+		return fmt.Errorf("%w: body is %d bytes longer than the declared %d", ErrContentLengthMismatch, extra, declared)
+	}
 	return nil
 }
 

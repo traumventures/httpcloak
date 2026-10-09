@@ -2818,6 +2818,13 @@ func applyExactHeaders(httpReq *http.Request, exact []fingerprint.HeaderPair, pr
 // outgoing request, overriding what http.NewRequest inferred from the body
 // reader's type. -1 leaves the length unknown, which the HTTP/1.1 writer frames
 // as chunked and HTTP/2 and HTTP/3 send without a content-length.
+//
+// A stated length is also enforced: the body must be exactly that long, or
+// the request fails with ErrContentLengthMismatch. On HTTP/1.1 a mismatch
+// misframes the connection (a short body makes the peer read the next
+// request as the rest of this one, a long one puts unframed bytes on the
+// wire), and on HTTP/2 and HTTP/3 a content-length that disagrees with the
+// DATA sent is a malformed request.
 func applyContentLength(httpReq *http.Request, req *Request) {
 	if req.BodyReader == nil || req.ContentLength == 0 {
 		return
@@ -2827,7 +2834,56 @@ func applyContentLength(httpReq *http.Request, req *Request) {
 		return
 	}
 	httpReq.ContentLength = req.ContentLength
+	if httpReq.Body != nil && httpReq.Body != http.NoBody {
+		httpReq.Body = &exactLengthBody{body: httpReq.Body, remaining: req.ContentLength, declared: req.ContentLength}
+	}
 }
+
+// ErrContentLengthMismatch reports a request body whose length differs from
+// the Content-Length the request declared. The request is not completed and,
+// on HTTP/1.1, the connection is not reusable.
+var ErrContentLengthMismatch = errors.New("request body length does not match Content-Length")
+
+// exactLengthBody fails a body that ends before, or runs past, its declared
+// length. It reads one byte beyond the declared end to tell "exactly as
+// long" from "longer", as net/http does.
+type exactLengthBody struct {
+	body      io.ReadCloser
+	remaining int64
+	declared  int64
+}
+
+func (b *exactLengthBody) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		var probe [1]byte
+		n, err := b.body.Read(probe[:])
+		if n > 0 {
+			return 0, fmt.Errorf("%w: body is longer than the declared %d bytes", ErrContentLengthMismatch, b.declared)
+		}
+		if err == nil {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.body.Read(p)
+	b.remaining -= int64(n)
+	if err == io.EOF && b.remaining > 0 {
+		return n, fmt.Errorf("%w: body ended after %d of %d bytes", ErrContentLengthMismatch, b.declared-b.remaining, b.declared)
+	}
+	if err == io.EOF {
+		// Reached the declared end exactly; the next Read checks for more.
+		err = nil
+		if n == 0 {
+			return b.Read(p)
+		}
+	}
+	return n, err
+}
+
+func (b *exactLengthBody) Close() error { return b.body.Close() }
 
 // mergeCallerHeaders folds Request.Headers over whatever the preset pipeline
 // produced. The first value replaces, the rest append, so a caller can both

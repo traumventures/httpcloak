@@ -471,6 +471,14 @@ type Response struct {
 	Protocol string // "h1", "h2", or "h3"
 	History  []*RedirectInfo
 
+	// ContentLength is the length of Body in bytes as the caller will read
+	// it, or -1 when unknown. Buffered responses always know it. A streamed
+	// response on an owned connection reports the origin's length when the
+	// body is passed through as-is, and -1 for a chunked body or one being
+	// decompressed on the fly, whose decoded length nobody knows yet. A
+	// forwarding proxy needs it to frame the body it relays.
+	ContentLength int64
+
 	// bodyBytes caches the body after reading for multiple access
 	bodyBytes []byte
 	bodyRead  bool
@@ -2004,17 +2012,18 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode:   resp.StatusCode,
-		Headers:      headers,
-		HeaderOrder:  responseHeaderOrder(resp.Header),
-		HeaderCasing: takeHeaderCasing(resp.Header),
-		Trailer:      buildTrailerMap(resp.Trailer),
-		Body:         io.NopCloser(bytes.NewReader(body)),
-		FinalURL:     req.URL,
-		Timing:       timing,
-		Protocol:     "h1",
-		bodyBytes:    body,
-		bodyRead:     true,
+		StatusCode:    resp.StatusCode,
+		Headers:       headers,
+		HeaderOrder:   responseHeaderOrder(resp.Header),
+		HeaderCasing:  takeHeaderCasing(resp.Header),
+		Trailer:       buildTrailerMap(resp.Trailer),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      req.URL,
+		Timing:        timing,
+		Protocol:      "h1",
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 
@@ -2109,17 +2118,18 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode:   resp.StatusCode,
-		Headers:      headers,
-		HeaderOrder:  responseHeaderOrder(resp.Header),
-		HeaderCasing: takeHeaderCasing(resp.Header),
-		Trailer:      buildTrailerMap(resp.Trailer),
-		Body:         io.NopCloser(bytes.NewReader(body)),
-		FinalURL:     parsedURL.String(),
-		Timing:       timing,
-		Protocol:     "h1",
-		bodyBytes:    body,
-		bodyRead:     true,
+		StatusCode:    resp.StatusCode,
+		Headers:       headers,
+		HeaderOrder:   responseHeaderOrder(resp.Header),
+		HeaderCasing:  takeHeaderCasing(resp.Header),
+		Trailer:       buildTrailerMap(resp.Trailer),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      parsedURL.String(),
+		Timing:        timing,
+		Protocol:      "h1",
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 
@@ -2240,17 +2250,18 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode:   resp.StatusCode,
-		Headers:      headers,
-		HeaderOrder:  responseHeaderOrder(resp.Header),
-		HeaderCasing: takeHeaderCasing(resp.Header),
-		Trailer:      buildTrailerMap(resp.Trailer),
-		Body:         io.NopCloser(bytes.NewReader(body)),
-		FinalURL:     req.URL,
-		Timing:       timing,
-		Protocol:     "h2",
-		bodyBytes:    body,
-		bodyRead:     true,
+		StatusCode:    resp.StatusCode,
+		Headers:       headers,
+		HeaderOrder:   responseHeaderOrder(resp.Header),
+		HeaderCasing:  takeHeaderCasing(resp.Header),
+		Trailer:       buildTrailerMap(resp.Trailer),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      req.URL,
+		Timing:        timing,
+		Protocol:      "h2",
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 
@@ -2377,17 +2388,18 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode:   resp.StatusCode,
-		Headers:      headers,
-		HeaderOrder:  responseHeaderOrder(resp.Header),
-		HeaderCasing: takeHeaderCasing(resp.Header),
-		Trailer:      buildTrailerMap(resp.Trailer),
-		Body:         io.NopCloser(bytes.NewReader(body)),
-		FinalURL:     req.URL,
-		Timing:       timing,
-		Protocol:     "h3",
-		bodyBytes:    body,
-		bodyRead:     true,
+		StatusCode:    resp.StatusCode,
+		Headers:       headers,
+		HeaderOrder:   responseHeaderOrder(resp.Header),
+		HeaderCasing:  takeHeaderCasing(resp.Header),
+		Trailer:       buildTrailerMap(resp.Trailer),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      req.URL,
+		Timing:        timing,
+		Protocol:      "h3",
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 

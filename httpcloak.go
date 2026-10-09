@@ -1090,6 +1090,55 @@ func WithCustomFingerprint(fp CustomFingerprint) SessionOption {
 
 // NewSession creates a new persistent session with cookie management
 func NewSession(preset string, opts ...SessionOption) *Session {
+	cfg := applySessionOptions(preset, opts)
+	sessionCfg, sessionOpts := cfg.build()
+
+	var s *session.Session
+	if sessionOpts != nil {
+		s = session.NewSessionWithOptions("", sessionCfg, sessionOpts)
+	} else {
+		s = session.NewSession("", sessionCfg)
+	}
+	// Deferred like the other config errors: NewSession has no error return, so
+	// it surfaces on the first request rather than at construction.
+	return &Session{inner: s, configErr: cfg.err()}
+}
+
+// NewTransport creates a bare transport.Transport from the same options as
+// NewSession, without the HTTP-client layer on top: no cookie jar, no
+// redirect following, no retry loop, no conditional cache.
+//
+// Use it when you need httpcloak's fingerprinting and protocol handling but
+// not stateful client semantics. The typical case is a forwarding proxy: it
+// relays many unrelated clients' requests, so a cookie stored for one flow or
+// a redirect followed on another's behalf leaks state between them, and a
+// silent retry re-sends a request the client never repeated.
+//
+// The transport is built by the same code path as a session's
+// (session.BuildTransport), so every transport-level option applies exactly as
+// it does for NewSession. Session-only options (redirects, retry,
+// switch-protocol, cookie jar, conditional cache, client-hint toggles) have no
+// transport-level meaning and are ignored.
+//
+// Unlike NewSession, configuration errors are returned here rather than
+// deferred to the first request: an invalid custom fingerprint, or a preset
+// name fingerprint.GetStrict does not know.
+//
+// The file opened by WithKeyLogFile is not closed by Transport.Close (a
+// session closes it, a bare transport has no owner for it); use
+// SetKeyLogWriter for key logging with NewTransport instead.
+func NewTransport(preset string, opts ...SessionOption) (*transport.Transport, error) {
+	cfg := applySessionOptions(preset, opts)
+	if err := cfg.err(); err != nil {
+		return nil, err
+	}
+	sessionCfg, sessionOpts := cfg.build()
+	t, _ := session.BuildTransport(sessionCfg.Preset, sessionCfg, sessionOpts)
+	return t, nil
+}
+
+// applySessionOptions runs the option functions over a default config.
+func applySessionOptions(preset string, opts []SessionOption) *sessionConfig {
 	cfg := &sessionConfig{
 		preset:  preset,
 		timeout: 30 * time.Second,
@@ -1097,7 +1146,29 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	return cfg
+}
 
+// err reports a configuration error: a deferred option-parsing error first,
+// then an unrecognised preset name.
+//
+// An unrecognised preset name is a config error, not something to paper over.
+// Get() answers it with chrome-146, so a single mistyped character used to put
+// a three-version-old fingerprint on the wire with nothing said about it, which
+// is the one failure this library exists to prevent.
+func (cfg *sessionConfig) err() error {
+	if cfg.configErr != nil {
+		return cfg.configErr
+	}
+	if cfg.preset != "" && fingerprint.GetStrict(cfg.preset) == nil {
+		return fingerprint.UnknownPresetError(cfg.preset)
+	}
+	return nil
+}
+
+// build translates the option set into the session package's configuration.
+// The returned SessionOptions is nil when none of its fields are needed.
+func (cfg *sessionConfig) build() (*protocol.SessionConfig, *session.SessionOptions) {
 	sessionCfg := &protocol.SessionConfig{
 		Preset:                        cfg.preset,
 		Proxy:                         cfg.proxy,
@@ -1157,35 +1228,19 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 		sessionCfg.DisableHTTP3 = true
 	}
 
-	// Create session with optional distributed cache and custom fingerprint
-	var s *session.Session
 	needsOpts := cfg.sessionCacheBackend != nil || cfg.customJA3 != "" || cfg.customH2Settings != nil || len(cfg.customPseudoOrder) > 0 || cfg.customTCPFingerprint != nil
-	if needsOpts {
-		opts := &session.SessionOptions{
-			SessionCacheBackend:       cfg.sessionCacheBackend,
-			SessionCacheErrorCallback: cfg.sessionCacheErrorCallback,
-			CustomJA3:                 cfg.customJA3,
-			CustomJA3Extras:           cfg.customJA3Extras,
-			CustomH2Settings:          cfg.customH2Settings,
-			CustomPseudoOrder:         cfg.customPseudoOrder,
-			CustomTCPFingerprint:      cfg.customTCPFingerprint,
-		}
-		s = session.NewSessionWithOptions("", sessionCfg, opts)
-	} else {
-		s = session.NewSession("", sessionCfg)
+	if !needsOpts {
+		return sessionCfg, nil
 	}
-	// An unrecognised preset name is a config error, not something to paper
-	// over. Get() answers it with chrome-146, so a single mistyped character
-	// used to put a three-version-old fingerprint on the wire with nothing said
-	// about it, which is the one failure this library exists to prevent.
-	//
-	// Deferred like the other config errors: NewSession has no error return, so
-	// it surfaces on the first request rather than at construction.
-	configErr := cfg.configErr
-	if configErr == nil && cfg.preset != "" && fingerprint.GetStrict(cfg.preset) == nil {
-		configErr = fingerprint.UnknownPresetError(cfg.preset)
+	return sessionCfg, &session.SessionOptions{
+		SessionCacheBackend:       cfg.sessionCacheBackend,
+		SessionCacheErrorCallback: cfg.sessionCacheErrorCallback,
+		CustomJA3:                 cfg.customJA3,
+		CustomJA3Extras:           cfg.customJA3Extras,
+		CustomH2Settings:          cfg.customH2Settings,
+		CustomPseudoOrder:         cfg.customPseudoOrder,
+		CustomTCPFingerprint:      cfg.customTCPFingerprint,
 	}
-	return &Session{inner: s, configErr: configErr}
 }
 
 // toResponse converts a transport response, including its redirect history.

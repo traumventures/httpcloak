@@ -140,6 +140,51 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 		}
 	}
 
+	t, keyLogWriter := BuildTransport(presetName, config, opts)
+
+	// Parse switch protocol if configured
+	switchProto := transport.ProtocolAuto
+	if config.SwitchProtocol != "" {
+		p, err := parseProtocol(config.SwitchProtocol)
+		if err == nil {
+			switchProto = p
+		}
+	}
+
+	return &Session{
+		ID:                            id,
+		CreatedAt:                     time.Now(),
+		LastUsed:                      time.Now(),
+		RequestCount:                  0,
+		Config:                        config,
+		transport:                     t,
+		cookies:                       NewCookieJar(),
+		cacheEntries:                  make(map[string]*cacheEntry),
+		conditionalCacheEnabled:       !config.WithoutConditionalCache,
+		clientHints:                   make(map[string]map[string]bool),
+		clientHintsEnabled:            !config.WithoutClientHints,
+		highEntropyClientHintsEnabled: !config.WithoutHighEntropyClientHints,
+		keyLogWriter:                  keyLogWriter,
+		switchProtocol:                switchProto,
+		active:                        true,
+	}
+}
+
+// BuildTransport constructs the transport a session with this configuration
+// would use, applying every transport-level setting exactly as
+// NewSessionWithOptions does: proxy routing, custom JA3/Akamai/TCP
+// fingerprint, ECH, TLS verification, protocol forcing, IPv4 preference and
+// the timeout. Session-level settings (cookies, redirects, retry, conditional
+// cache, client-hint state, switch protocol) are not part of a transport and
+// are ignored here.
+//
+// It exists so a caller that only wants the transport (a forwarding proxy,
+// say, where per-client HTTP state must not leak between flows) builds it
+// through the same code as a session rather than a copy that can drift.
+//
+// The returned key log writer is non-nil when config.KeyLogFile was opened;
+// the caller owns it and must close it after the transport.
+func BuildTransport(presetName string, config *protocol.SessionConfig, opts *SessionOptions) (*transport.Transport, io.WriteCloser) {
 	// Create key log writer if KeyLogFile is specified
 	var keyLogWriter io.WriteCloser
 	if config.KeyLogFile != "" {
@@ -239,32 +284,7 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 		t.SetDisableECH(true)
 	}
 
-	// Parse switch protocol if configured
-	switchProto := transport.ProtocolAuto
-	if config.SwitchProtocol != "" {
-		p, err := parseProtocol(config.SwitchProtocol)
-		if err == nil {
-			switchProto = p
-		}
-	}
-
-	return &Session{
-		ID:                            id,
-		CreatedAt:                     time.Now(),
-		LastUsed:                      time.Now(),
-		RequestCount:                  0,
-		Config:                        config,
-		transport:                     t,
-		cookies:                       NewCookieJar(),
-		cacheEntries:                  make(map[string]*cacheEntry),
-		conditionalCacheEnabled:       !config.WithoutConditionalCache,
-		clientHints:                   make(map[string]map[string]bool),
-		clientHintsEnabled:            !config.WithoutClientHints,
-		highEntropyClientHintsEnabled: !config.WithoutHighEntropyClientHints,
-		keyLogWriter:                  keyLogWriter,
-		switchProtocol:                switchProto,
-		active:                        true,
-	}
+	return t, keyLogWriter
 }
 
 // Request executes an HTTP request within this session

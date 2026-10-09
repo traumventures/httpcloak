@@ -418,21 +418,7 @@ func (t *HTTP1Transport) RoundTripWithTLSConn(req *http.Request, tlsConn *utls.U
 	}
 	t.closedMu.RUnlock()
 
-	// Wrap the existing TLS connection into an http1Conn
-	handoffState := tlsConn.ConnectionState()
-	conn := &http1Conn{
-		host:           host,
-		port:           port,
-		conn:           tlsConn,
-		tlsConn:        tlsConn,
-		createdAt:      time.Now(),
-		lastUsedAt:     time.Now(),
-		sessionResumed: handoffState.DidResume,
-		tlsVersion:     handoffState.Version,
-		cipherSuite:    handoffState.CipherSuite,
-		br:             bufio.NewReaderSize(tlsConn, 64*1024),  // 64KB read buffer
-		bw:             bufio.NewWriterSize(tlsConn, 256*1024), // 256KB write buffer
-	}
+	conn := newHandoffConn(tlsConn, host, port)
 
 	stopWatch := watchContext(req.Context(), conn)
 	resp, err := t.doRequest(conn, req)
@@ -454,6 +440,25 @@ func (t *HTTP1Transport) RoundTripWithTLSConn(req *http.Request, tlsConn *utls.U
 	}
 
 	return resp, nil
+}
+
+// newHandoffConn wraps an established TLS connection that did not come from
+// this transport's own dialer into an http1Conn.
+func newHandoffConn(tlsConn *utls.UConn, host, port string) *http1Conn {
+	handoffState := tlsConn.ConnectionState()
+	return &http1Conn{
+		host:           host,
+		port:           port,
+		conn:           tlsConn,
+		tlsConn:        tlsConn,
+		createdAt:      time.Now(),
+		lastUsedAt:     time.Now(),
+		sessionResumed: handoffState.DidResume,
+		tlsVersion:     handoffState.Version,
+		cipherSuite:    handoffState.CipherSuite,
+		br:             bufio.NewReaderSize(tlsConn, 64*1024),  // 64KB read buffer
+		bw:             bufio.NewWriterSize(tlsConn, 256*1024), // 256KB write buffer
+	}
 }
 
 // pooledBodyWrapper wraps response body to return connection to pool when done.

@@ -834,24 +834,7 @@ alpnCheck:
 		}
 	}
 
-	// Check TLSOnly mode: no automatic Accept-Encoding, no default User-Agent.
-	tlsOnly := t.config != nil && t.config.TLSOnly
-
-	// One builder for both entrypoints. The transport path and the pool path
-	// used to construct this literal independently and had drifted; see
-	// internal/h2build.
-	h2Transport := h2build.Transport(h2build.Options{
-		Preset:  t.preset,
-		TLSOnly: tlsOnly,
-		PseudoHeaderOrder: func() []string {
-			if t.config != nil && len(t.config.CustomPseudoOrder) > 0 {
-				return t.config.CustomPseudoOrder
-			}
-			return nil
-		}(),
-	})
-
-	h2Conn, err := h2Transport.NewClientConn(tlsConn)
+	h2Conn, err := t.clientTransport().NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
 		return nil, fmt.Errorf("HTTP/2 setup failed: %w", err)
@@ -877,6 +860,27 @@ alpnCheck:
 		tcpMs:          tcpElapsed,
 		tlsMs:          tlsElapsed,
 	}, nil
+}
+
+// clientTransport builds the HTTP/2 client transport for this preset: SETTINGS
+// values and order, WINDOW_UPDATE, PRIORITY, pseudo-header order, HPACK policy.
+// Every HTTP/2 connection this transport speaks over, pooled or caller-owned,
+// is set up through here, so they cannot differ on the wire.
+//
+// One builder for both entrypoints. The transport path and the pool path used
+// to construct this literal independently and had drifted; see internal/h2build.
+func (t *HTTP2Transport) clientTransport() *http2.Transport {
+	// TLSOnly mode: no automatic Accept-Encoding, no default User-Agent.
+	tlsOnly := t.config != nil && t.config.TLSOnly
+	var pseudoOrder []string
+	if t.config != nil && len(t.config.CustomPseudoOrder) > 0 {
+		pseudoOrder = t.config.CustomPseudoOrder
+	}
+	return h2build.Transport(h2build.Options{
+		Preset:            t.preset,
+		TLSOnly:           tlsOnly,
+		PseudoHeaderOrder: pseudoOrder,
+	})
 }
 
 // clientHelloSpec resolves a FRESH ClientHelloSpec for one connection. Fresh

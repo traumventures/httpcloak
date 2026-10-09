@@ -1122,18 +1122,38 @@ func (t *HTTP1Transport) doRequest(conn *http1Conn, req *http.Request) (*http.Re
 		return nil, err
 	}
 
-	// Read response. The casing peek has to happen first: it reads nothing, but
-	// once ReadResponse has consumed the header block the original spelling is
-	// gone, since the parse underneath canonicalises the names.
-	casing := peekHeaderCasing(conn.br)
-	resp, err := http.ReadResponse(conn.br, req)
-	if err != nil {
-		return nil, err
+	// Read the response, skipping interim ones. A 1xx other than 101 (100
+	// Continue, 103 Early Hints, ...) is not the answer to the request; the
+	// final response follows it on the same connection. Returning the 1xx as
+	// final would leave the real response unread, and the next request on
+	// the connection would be handed it. net/http's transport skips them the
+	// same way, with the same cap.
+	//
+	// The casing peek has to happen before each ReadResponse: it reads
+	// nothing, but once ReadResponse has consumed the header block the
+	// original spelling is gone, since the parse underneath canonicalises the
+	// names.
+	for interim := 0; ; interim++ {
+		casing := peekHeaderCasing(conn.br)
+		resp, err := http.ReadResponse(conn.br, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 100 && resp.StatusCode <= 199 && resp.StatusCode != http.StatusSwitchingProtocols {
+			if interim >= maxInterimResponses {
+				return nil, fmt.Errorf("http1: too many 1xx informational responses")
+			}
+			continue
+		}
+		stashHeaderCasing(resp.Header, casing)
+		return resp, nil
 	}
-	stashHeaderCasing(resp.Header, casing)
-
-	return resp, nil
 }
+
+// maxInterimResponses bounds the 1xx responses accepted before the final one,
+// as net/http does, so a peer cannot hold a request open with an endless
+// stream of them.
+const maxInterimResponses = 5
 
 // writeRequest writes an HTTP/1.1 request with browser-like header ordering
 func (t *HTTP1Transport) writeRequest(conn *http1Conn, req *http.Request) error {

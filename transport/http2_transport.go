@@ -741,31 +741,11 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// Generate fresh spec for this connection to avoid race condition
-	// utls's ApplyPreset mutates the spec (clears KeyShares.Data, etc.), so each
-	// connection needs its own copy. Use same shuffleSeed for consistent ordering.
-	// One resolver for every TLS source, shared with the H1 transport. This used
-	// to be an inline if/else chain whose first arm was `if ja3String != ""`,
-	// taken unconditionally, which made the PSK arm below it unreachable for any
-	// JA3 preset. Adding raw hellos as a fourth source to that shape would have
-	// reproduced the same bug, so the decision lives in fingerprint now.
-	customJA3, customJA3Extras := "", (*fingerprint.JA3Extras)(nil)
-	if t.config != nil {
-		customJA3, customJA3Extras = t.config.CustomJA3, t.config.CustomJA3Extras
-	}
-	specToUse, specSource, specErr := fingerprint.ResolveClientHelloSpec(
-		t.preset, customJA3, customJA3Extras, t.hasPSKSpec, t.shuffleSeed)
+	// Fresh spec for this connection; see clientHelloSpec.
+	specToUse, specErr := t.clientHelloSpec()
 	if specErr != nil {
 		rawConn.Close()
-		return nil, fmt.Errorf("resolve client hello: %w", specErr)
-	}
-	// The preset's TCP signature_algorithms override (Chrome 150's ML-DSA
-	// codepoints, for instance) layers on top of a ClientHelloID base only. JA3
-	// carries its own via JA3Extras, and a captured raw hello already contains
-	// the client's real list, so overwriting it there would undo the capture.
-	if specSource == fingerprint.SourceClientHelloID {
-		fingerprint.ApplySignatureAlgorithms(specToUse.Extensions, t.preset.SignatureAlgorithms)
-		fingerprint.ApplyTrustAnchors(&specToUse.Extensions, t.preset.TrustAnchors)
+		return nil, specErr
 	}
 
 	// Fetch ECH config if needed. skipECH forces a no-ECH handshake, used by the
@@ -782,69 +762,11 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 		}
 	}
 
-	// Determine MinVersion based on ECH usage
-	// ECH requires TLS 1.3, so set MinVersion accordingly
-	minVersion := uint16(tls.VersionTLS12)
-	if len(echConfigList) > 0 {
-		minVersion = tls.VersionTLS13
-	}
-
-	// Determine key log writer - config override or global
-	var keyLogWriter io.Writer
-	if t.config != nil && t.config.KeyLogWriter != nil {
-		keyLogWriter = t.config.KeyLogWriter
-	} else {
-		keyLogWriter = GetKeyLogWriter()
-	}
-
-	// Wrap with uTLS for fingerprinting
-	tlsConfig := &utls.Config{
-		// Go ramps its TLS record sizes (1186*N until 128KB) to trade latency for
-		// throughput. No browser does that, and the ramp is arithmetic, so a
-		// server reading the cleartext record lengths can identify the TLS stack
-		// lineage rather than merely noting "not a browser". Disable it so every
-		// record is full-size, as BoringSSL's are.
-		//
-		// This MUST ship with the DATA frame cap. On its own, measured, it makes
-		// the profile worse: the short trailing records go from four to nine over
-		// eight frames and land in a clean alternating pattern instead of hiding
-		// inside the ramp.
-		DynamicRecordSizingDisabled:        true,
-		ServerName:                         host,
-		InsecureSkipVerify:                 t.insecureSkipVerify,
-		MinVersion:                         minVersion,
-		MaxVersion:                         tls.VersionTLS13,
-		OmitEmptyPsk:                       true,          // Chrome doesn't send empty PSK on first connection
-		PreferSkipResumptionOnNilExtension: true,          // Skip resumption if spec has no PSK extension instead of panicking
-		EncryptedClientHelloConfigList:     echConfigList, // ECH configuration (if available)
-		KeyLogWriter:                       keyLogWriter,
-	}
-	t.tlsVerify.Apply(tlsConfig)
-
-	// Only enable session cache if we have PSK spec - prevents panic when session
-	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
-	if t.hasPSKSpec {
-		tlsConfig.ClientSessionCache = t.sessionCache
-	}
-
-	// Create UClient with HelloCustom and apply our fresh spec
-	// This ensures the TLS extension order is consistent across all connections (same seed)
-	var tlsConn *utls.UConn
-	if specToUse != nil {
-		// Use fresh spec - extension order is consistent from shuffle seed
-		tlsConn = utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
-		if err := tlsConn.ApplyPreset(specToUse); err != nil {
-			rawConn.Close()
-			return nil, fmt.Errorf("failed to apply TLS preset: %w", err)
-		}
-	} else {
-		// Fallback to ClientHelloID if spec generation failed
-		tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
-	}
-
-	// Set session cache for TLS resumption (only if PSK spec available)
-	if t.hasPSKSpec {
-		tlsConn.SetSessionCache(t.sessionCache)
+	tlsConfig := t.utlsConfig(host, echConfigList)
+	tlsConn, err := t.newUTLSConn(rawConn, tlsConfig, specToUse)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
 	}
 
 	// Perform TLS handshake
@@ -865,53 +787,21 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 				return nil, fmt.Errorf("speculative TLS fallback dial failed: %w", dialErr)
 			}
 
-			// Regenerate fresh TLS spec (the previous one was consumed)
-			var fallbackSpec *utls.ClientHelloSpec
-			// Reuse same JA3 resolution logic as primary path
-			fallbackJA3 := ""
-			var fallbackJA3Extras *fingerprint.JA3Extras
-			if t.config != nil && t.config.CustomJA3 != "" {
-				fallbackJA3 = t.config.CustomJA3
-				fallbackJA3Extras = t.config.CustomJA3Extras
-			} else if t.preset.JA3 != "" {
-				fallbackJA3 = t.preset.JA3
-				fallbackJA3Extras = t.preset.JA3Extras
+			// Regenerate a fresh spec (the previous one was consumed) through the
+			// same resolver as the primary attempt. This used to be a second,
+			// older copy of the selection chain that knew neither captured raw
+			// hellos nor PSK JA3 variants, so a proxy that refused speculative
+			// TLS silently got a different ClientHello than every other
+			// connection of the same transport.
+			fallbackSpec, specErr := t.clientHelloSpec()
+			if specErr != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("speculative TLS fallback: %w", specErr)
 			}
-			if fallbackJA3 != "" {
-				spec, parseErr := fingerprint.ParseJA3(fallbackJA3, fallbackJA3Extras)
-				if parseErr != nil {
-					rawConn.Close()
-					return nil, fmt.Errorf("speculative TLS fallback: failed to parse JA3: %w", parseErr)
-				}
-				fallbackSpec = spec
-			} else if t.hasPSKSpec {
-				if spec, specErr := utls.UTLSIdToSpecWithSeed(t.preset.PSKClientHelloID, t.shuffleSeed); specErr == nil {
-					fallbackSpec = &spec
-				}
-			}
-			if fallbackSpec == nil {
-				if spec, specErr := utls.UTLSIdToSpecWithSeed(t.preset.ClientHelloID, t.shuffleSeed); specErr == nil {
-					fallbackSpec = &spec
-				}
-			}
-			// Keep the same TCP signature_algorithms override on the fallback spec.
-			if fallbackJA3 == "" && fallbackSpec != nil {
-				fingerprint.ApplySignatureAlgorithms(fallbackSpec.Extensions, t.preset.SignatureAlgorithms)
-				fingerprint.ApplyTrustAnchors(&fallbackSpec.Extensions, t.preset.TrustAnchors)
-			}
-
-			// Redo TLS handshake on the clean connection
-			if fallbackSpec != nil {
-				tlsConn = utls.UClient(rawConn, tlsConfig, utls.HelloCustom)
-				if applyErr := tlsConn.ApplyPreset(fallbackSpec); applyErr != nil {
-					rawConn.Close()
-					return nil, fmt.Errorf("speculative TLS fallback preset failed: %w", applyErr)
-				}
-			} else {
-				tlsConn = utls.UClient(rawConn, tlsConfig, t.preset.ClientHelloID)
-			}
-			if t.hasPSKSpec {
-				tlsConn.SetSessionCache(t.sessionCache)
+			tlsConn, err = t.newUTLSConn(rawConn, tlsConfig, fallbackSpec)
+			if err != nil {
+				rawConn.Close()
+				return nil, fmt.Errorf("speculative TLS fallback: %w", err)
 			}
 
 			if hsErr := tlsConn.HandshakeContext(ctx); hsErr != nil {
@@ -987,6 +877,103 @@ alpnCheck:
 		tcpMs:          tcpElapsed,
 		tlsMs:          tlsElapsed,
 	}, nil
+}
+
+// clientHelloSpec resolves a FRESH ClientHelloSpec for one connection. Fresh
+// per connection is required, not an optimisation: uTLS ApplyPreset mutates the
+// spec it is handed.
+//
+// The source decision (custom JA3 > raw captured hello > preset JA3 >
+// ClientHelloID, each with its PSK variant when the transport resumes) lives in
+// fingerprint.ResolveClientHelloSpec. The preset's TCP signature_algorithms and
+// trust-anchor overrides layer on top of a ClientHelloID base only: JA3 carries
+// its own via JA3Extras, and a captured raw hello already contains the client's
+// real list, so overwriting it there would undo the capture.
+//
+// Every TLS handshake this transport performs goes through here, so they all
+// present the same ClientHello.
+func (t *HTTP2Transport) clientHelloSpec() (*utls.ClientHelloSpec, error) {
+	customJA3, customJA3Extras := "", (*fingerprint.JA3Extras)(nil)
+	if t.config != nil {
+		customJA3, customJA3Extras = t.config.CustomJA3, t.config.CustomJA3Extras
+	}
+	spec, source, err := fingerprint.ResolveClientHelloSpec(
+		t.preset, customJA3, customJA3Extras, t.hasPSKSpec, t.shuffleSeed)
+	if err != nil {
+		return nil, fmt.Errorf("resolve client hello: %w", err)
+	}
+	if source == fingerprint.SourceClientHelloID {
+		fingerprint.ApplySignatureAlgorithms(spec.Extensions, t.preset.SignatureAlgorithms)
+		fingerprint.ApplyTrustAnchors(&spec.Extensions, t.preset.TrustAnchors)
+	}
+	return spec, nil
+}
+
+// utlsConfig builds the uTLS client config for one connection to serverName.
+// echConfigList may be nil; ECH requires TLS 1.3, so MinVersion is raised when
+// one is given.
+func (t *HTTP2Transport) utlsConfig(serverName string, echConfigList []byte) *utls.Config {
+	minVersion := uint16(tls.VersionTLS12)
+	if len(echConfigList) > 0 {
+		minVersion = tls.VersionTLS13
+	}
+
+	// Key log writer: config override, else the global one.
+	var keyLogWriter io.Writer
+	if t.config != nil && t.config.KeyLogWriter != nil {
+		keyLogWriter = t.config.KeyLogWriter
+	} else {
+		keyLogWriter = GetKeyLogWriter()
+	}
+
+	cfg := &utls.Config{
+		// Go ramps its TLS record sizes (1186*N until 128KB) to trade latency for
+		// throughput. No browser does that, and the ramp is arithmetic, so a
+		// server reading the cleartext record lengths can identify the TLS stack
+		// lineage rather than merely noting "not a browser". Disable it so every
+		// record is full-size, as BoringSSL's are.
+		//
+		// This MUST ship with the DATA frame cap. On its own, measured, it makes
+		// the profile worse: the short trailing records go from four to nine over
+		// eight frames and land in a clean alternating pattern instead of hiding
+		// inside the ramp.
+		DynamicRecordSizingDisabled:        true,
+		ServerName:                         serverName,
+		InsecureSkipVerify:                 t.insecureSkipVerify,
+		MinVersion:                         minVersion,
+		MaxVersion:                         tls.VersionTLS13,
+		OmitEmptyPsk:                       true,          // Chrome doesn't send empty PSK on first connection
+		PreferSkipResumptionOnNilExtension: true,          // Skip resumption if spec has no PSK extension instead of panicking
+		EncryptedClientHelloConfigList:     echConfigList, // ECH configuration (if available)
+		KeyLogWriter:                       keyLogWriter,
+	}
+	t.tlsVerify.Apply(cfg)
+
+	// Only enable session cache if we have PSK spec - prevents panic when session
+	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
+	if t.hasPSKSpec {
+		cfg.ClientSessionCache = t.sessionCache
+	}
+	return cfg
+}
+
+// newUTLSConn wraps rawConn in a uTLS client presenting spec, or the preset's
+// ClientHelloID when spec is nil. It does not handshake.
+func (t *HTTP2Transport) newUTLSConn(rawConn net.Conn, cfg *utls.Config, spec *utls.ClientHelloSpec) (*utls.UConn, error) {
+	var tlsConn *utls.UConn
+	if spec != nil {
+		tlsConn = utls.UClient(rawConn, cfg, utls.HelloCustom)
+		if err := tlsConn.ApplyPreset(spec); err != nil {
+			return nil, fmt.Errorf("failed to apply TLS preset: %w", err)
+		}
+	} else {
+		tlsConn = utls.UClient(rawConn, cfg, t.preset.ClientHelloID)
+	}
+	// Session cache for TLS resumption (only if PSK spec available).
+	if t.hasPSKSpec {
+		tlsConn.SetSessionCache(t.sessionCache)
+	}
+	return tlsConn, nil
 }
 
 // dialThroughProxy establishes a connection through a proxy using CONNECT

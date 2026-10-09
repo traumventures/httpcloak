@@ -182,9 +182,16 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 // say, where per-client HTTP state must not leak between flows) builds it
 // through the same code as a session rather than a copy that can drift.
 //
+// An empty presetName means chrome-latest, as for a session.
+//
 // The returned key log writer is non-nil when config.KeyLogFile was opened;
 // the caller owns it and must close it after the transport.
 func BuildTransport(presetName string, config *protocol.SessionConfig, opts *SessionOptions) (*transport.Transport, io.WriteCloser) {
+	// The same default as a session: an empty name means chrome-latest, not
+	// whatever fingerprint.Get falls back to for an unknown one.
+	if presetName == "" {
+		presetName = "chrome-latest"
+	}
 	// Create key log writer if KeyLogFile is specified
 	var keyLogWriter io.WriteCloser
 	if config.KeyLogFile != "" {

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/transport"
 )
 
@@ -203,5 +204,25 @@ func copyConn(dst, src net.Conn) (int64, error) {
 		if err != nil {
 			return n, err
 		}
+	}
+}
+
+// An empty preset name means chrome-latest for a transport, as for a session,
+// not the fallback fingerprint.Get answers unknown names with.
+func TestNewTransportDefaultPreset(t *testing.T) {
+	tr, err := NewTransport("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	s := NewSession("")
+	defer s.Close()
+	got := tr.GetHTTP1Transport().Preset().Name
+	want := s.GetTransport().GetHTTP1Transport().Preset().Name
+	if got != want {
+		t.Fatalf("NewTransport(\"\") uses %s, NewSession(\"\") %s", got, want)
+	}
+	if latest := fingerprint.GetStrict("chrome-latest").Name; got != latest {
+		t.Fatalf("NewTransport(\"\") uses %s, want chrome-latest (%s)", got, latest)
 	}
 }

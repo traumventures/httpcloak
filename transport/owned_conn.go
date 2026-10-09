@@ -98,7 +98,14 @@ func (t *HTTP2Transport) NewClientConnOnConn(ctx context.Context, tlsConn *utls.
 	if proto := tlsConn.ConnectionState().NegotiatedProtocol; proto != "h2" {
 		return nil, fmt.Errorf("H2ClientConn: ALPN is %q, want %q", proto, "h2")
 	}
-	h2Conn, err := t.clientTransport().NewClientConn(tlsConn)
+	h2t := t.clientTransport()
+	// A request beyond the peer's MAX_CONCURRENT_STREAMS waits for a stream
+	// to free up instead of failing as "client conn not usable". The pooled
+	// transport fails it so the pool dials another connection; an owned
+	// connection is the only one there is, and a browser waits too. This is
+	// client-side scheduling only: nothing on the wire changes.
+	h2t.StrictMaxConcurrentStreams = true
+	h2Conn, err := h2t.NewClientConn(tlsConn)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP/2 setup failed: %w", err)
 	}

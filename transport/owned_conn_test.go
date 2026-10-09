@@ -429,3 +429,40 @@ func TestH2RequestNotProcessed(t *testing.T) {
 		t.Fatalf("shut-down session: err = %v, H2RequestNotProcessed = false", err)
 	}
 }
+
+// A request beyond the peer's MAX_CONCURRENT_STREAMS waits for a free stream
+// on the owned connection rather than failing: there is no other connection
+// to put it on.
+func TestOwnedH2WaitsForAStream(t *testing.T) {
+	srv := startH2Server(t, h2Config{
+		Settings:   []h2Setting{{ID: 0x3, Val: 1}}, // MAX_CONCURRENT_STREAMS = 1
+		Body:       []byte(strings.Repeat("s", 40)),
+		Chunk:      10,
+		ChunkDelay: 60 * time.Millisecond,
+	})
+	tr := newTestTransport(t, "chrome-latest")
+	h2c, err := tr.NewH2ClientConn(context.Background(), dialOwned(t, tr, srv.addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2c.Close()
+	// Let the client see the server's SETTINGS before the burst.
+	if _, err := tr.DoOnH2Conn(context.Background(), &Request{URL: localURL(srv.addr, "/warm")}, h2c); err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func() {
+			_, err := tr.DoOnH2Conn(context.Background(), &Request{Method: "POST", URL: localURL(srv.addr, "/"), Body: []byte("x")}, h2c)
+			errs <- err
+		}()
+	}
+	for i := 0; i < 3; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("request on a full connection failed instead of waiting: %v", err)
+		}
+	}
+	if n := srv.connCount(); n != 1 {
+		t.Fatalf("server saw %d connections, want 1", n)
+	}
+}

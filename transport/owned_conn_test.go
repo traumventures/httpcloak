@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -396,5 +397,35 @@ func TestOwnedH1DoesNotRedial(t *testing.T) {
 	}
 	if n := srv.connCount(); n != 1 {
 		t.Fatalf("server saw %d connections, want 1: the transport re-dialled", n)
+	}
+}
+
+// H2RequestNotProcessed separates "the peer did not process this" (safe to
+// send again whatever the method) from everything else.
+func TestH2RequestNotProcessed(t *testing.T) {
+	const refused, internal = 0x7, 0x2
+	srv := startH2Server(t, h2Config{ResetStreams: map[int]uint32{1: refused, 2: internal}})
+	tr := newTestTransport(t, "chrome-latest")
+	h2c, err := tr.NewH2ClientConn(context.Background(), dialOwned(t, tr, srv.addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tr.DoOnH2Conn(context.Background(), &Request{Method: "POST", URL: localURL(srv.addr, "/"), Body: []byte("x")}, h2c)
+	if err == nil || !H2RequestNotProcessed(err) {
+		t.Fatalf("REFUSED_STREAM: err = %v, H2RequestNotProcessed = false", err)
+	}
+	_, err = tr.DoOnH2Conn(context.Background(), &Request{Method: "POST", URL: localURL(srv.addr, "/"), Body: []byte("x")}, h2c)
+	if err == nil || H2RequestNotProcessed(err) {
+		t.Fatalf("INTERNAL_ERROR: err = %v, reported as not processed", err)
+	}
+	if H2RequestNotProcessed(errors.New("read: connection reset by peer")) || H2RequestNotProcessed(nil) {
+		t.Fatal("unrelated errors reported as not processed")
+	}
+	// A session that can no longer take streams rejects the request before
+	// sending anything.
+	h2c.ClientConn().Shutdown(context.Background()) //nolint:errcheck
+	_, err = tr.DoOnH2Conn(context.Background(), &Request{Method: "POST", URL: localURL(srv.addr, "/"), Body: []byte("x")}, h2c)
+	if err == nil || !H2RequestNotProcessed(err) {
+		t.Fatalf("shut-down session: err = %v, H2RequestNotProcessed = false", err)
 	}
 }

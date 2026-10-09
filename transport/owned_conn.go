@@ -126,6 +126,27 @@ func (t *Transport) DoOnH2Conn(ctx context.Context, req *Request, h2c *H2ClientC
 	return t.doOnConn(ctx, req, "h2", h2c.h2Conn.RoundTrip)
 }
 
+// H2RequestNotProcessed reports whether an error from DoOnH2Conn or
+// DoStreamOnH2Conn proves the peer did not process the request, so it may be
+// sent again on another connection whatever its method: the session could
+// not take a new stream, a GOAWAY's last-stream-id excluded it, or the peer
+// refused the stream (REFUSED_STREAM). These are the cases net/http's HTTP/2
+// transport replays on its own. Anything else, a reset with another code or a
+// connection lost after the request went out included, may have been
+// processed.
+func H2RequestNotProcessed(err error) bool {
+	probe := &http.Request{}
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if se, ok := e.(http2.StreamError); ok {
+			return se.Code == http2.ErrCodeRefusedStream
+		}
+		if r, _ := http2.ShouldRetryRequest(probe, e); r != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // HTTP/1.1
 // ---------------------------------------------------------------------------

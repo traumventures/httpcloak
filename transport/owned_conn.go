@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -151,9 +152,10 @@ var ErrOwnedConnNotReusable = errors.New("http1: response body closed before EOF
 // HTTP/1.1 is not multiplexed: the caller must not start another exchange on
 // tlsConn until the returned body is closed. Close leaves the connection at
 // the next message boundary when it can: after EOF trivially, otherwise by
-// draining a bounded remainder (256 KiB / 2 s). When it cannot, or when the
-// exchange was interrupted (error, cancelled context), the connection is
-// closed, because its framing is no longer known; Close then reports
+// draining a bounded remainder (256 KiB / 2 s). When it cannot, when the
+// exchange was interrupted (error, cancelled context), or when the exchange
+// ended the connection (Connection: close on either side, a body delimited
+// by the peer closing), the connection is closed and Close reports
 // ErrOwnedConnNotReusable.
 //
 // The socket deadline follows the request context: once headers arrive the
@@ -204,6 +206,13 @@ func (t *HTTP1Transport) RoundTripOnConn(req *http.Request, tlsConn *utls.UConn,
 		conn:      conn,
 		stopWatch: stopWatch,
 		ctx:       ctx,
+		// The exchange ends the connection when either side said so
+		// (Connection: close, an HTTP/1.0 peer without keep-alive) or when
+		// the body is delimited by the peer closing it: http.ReadResponse
+		// sets resp.Close for both. Reusing it would write the next request
+		// into a socket the peer is closing, or after a body whose end was
+		// the close itself.
+		lastExchange: resp.Close || req.Close || headerHasToken(req.Header, "Connection", "close"),
 	}
 	return resp, nil
 }
@@ -218,6 +227,10 @@ type ownedBodyWrapper struct {
 	eof       atomic.Bool
 	once      sync.Once
 	closeErr  error
+
+	// lastExchange marks a response after which the connection must not
+	// carry another request.
+	lastExchange bool
 }
 
 func (w *ownedBodyWrapper) Read(p []byte) (int, error) {
@@ -232,8 +245,8 @@ func (w *ownedBodyWrapper) Read(p []byte) (int, error) {
 
 func (w *ownedBodyWrapper) Close() error {
 	w.once.Do(func() {
-		reusable := true
-		if !w.eof.Load() {
+		reusable := !w.lastExchange
+		if reusable && !w.eof.Load() {
 			// Bound the drain in time as well as size. The deadline also
 			// unblocks a Read still in flight on another goroutine, which
 			// holds the body's lock the drain needs.
@@ -253,6 +266,19 @@ func (w *ownedBodyWrapper) Close() error {
 		w.conn.conn.SetDeadline(time.Time{})
 	})
 	return w.closeErr
+}
+
+// headerHasToken reports whether the comma-separated header contains token,
+// case-insensitively.
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, v := range h.Values(name) {
+		for _, t := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // DoOnTLSConn runs one HTTP/1.1 request on a caller-owned TLS connection that
@@ -372,17 +398,18 @@ func (t *Transport) doOnConn(ctx context.Context, req *Request, proto string, ro
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
 	return &Response{
-		StatusCode:   resp.StatusCode,
-		Headers:      buildHeadersMap(resp.Header),
-		HeaderOrder:  responseHeaderOrder(resp.Header),
-		HeaderCasing: takeHeaderCasing(resp.Header),
-		Trailer:      buildTrailerMap(resp.Trailer),
-		Body:         io.NopCloser(bytes.NewReader(body)),
-		FinalURL:     req.URL,
-		Timing:       timing,
-		Protocol:     proto,
-		bodyBytes:    body,
-		bodyRead:     true,
+		StatusCode:    resp.StatusCode,
+		Headers:       buildHeadersMap(resp.Header),
+		HeaderOrder:   responseHeaderOrder(resp.Header),
+		HeaderCasing:  takeHeaderCasing(resp.Header),
+		Trailer:       buildTrailerMap(resp.Trailer),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		FinalURL:      req.URL,
+		Timing:        timing,
+		Protocol:      proto,
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 

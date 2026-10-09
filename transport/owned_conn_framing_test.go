@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -180,5 +181,65 @@ func TestRequestContentLengthEnforcedH2(t *testing.T) {
 		if err == nil {
 			t.Fatalf("body of %d bytes with content-length %d was accepted", len(tc.body), tc.length)
 		}
+	}
+}
+
+// A response that ends the connection (Connection: close, or a body delimited
+// by the server closing) must not leave the connection looking reusable.
+func TestOwnedH1LastExchangeIsNotReusable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		path    string
+		headers map[string][]string
+		want    string
+	}{
+		{"server Connection: close", "/close", nil, "bye"},
+		{"close-delimited body", "/eof", nil, "until-eof"},
+		{"client Connection: close", "/plain", map[string][]string{"Connection": {"close"}}, "path=/plain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := startH1WireServer(t, framingH1Handler)
+			tr := newTestTransport(t, "chrome-latest")
+			tlsConn := dialOwned(t, tr, srv.addr)
+			resp, err := tr.DoStreamOnTLSConn(context.Background(), &Request{URL: localURL(srv.addr, tc.path), Headers: tc.headers}, tlsConn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || string(body) != tc.want {
+				t.Fatalf("body %q, %v", body, err)
+			}
+			if err := resp.Body.Close(); !errors.Is(err, ErrOwnedConnNotReusable) {
+				t.Fatalf("Close = %v, want ErrOwnedConnNotReusable", err)
+			}
+			if _, err := tlsConn.Write([]byte("x")); err == nil {
+				t.Fatal("connection left open after its last exchange")
+			}
+		})
+	}
+}
+
+func TestOwnedBufferedResponseContentLength(t *testing.T) {
+	srv := startH1WireServer(t, framingH1Handler)
+	tr := newTestTransport(t, "chrome-latest")
+	resp, err := tr.DoOnTLSConn(context.Background(), &Request{URL: localURL(srv.addr, "/some")}, dialOwned(t, tr, srv.addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.ContentLength != int64(len("path=/some")) {
+		t.Fatalf("ContentLength %d", resp.ContentLength)
+	}
+	h2 := startH2Server(t, h2Config{Body: []byte(strings.Repeat("z", 123))})
+	h2c, err := tr.NewH2ClientConn(context.Background(), dialOwned(t, tr, h2.addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h2c.Close()
+	resp, err = tr.DoOnH2Conn(context.Background(), &Request{URL: localURL(h2.addr, "/")}, h2c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.ContentLength != 123 {
+		t.Fatalf("h2 ContentLength %d", resp.ContentLength)
 	}
 }
